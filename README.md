@@ -1,3 +1,5 @@
+(no longer required, ipv6 fork merged to master)
+
 sslh -- A ssl/ssh multiplexer
 =============================
 
