@@ -45,16 +45,16 @@ static int is_true(const char *p, int len, struct proto* proto) { return 1; }
 /* Table of protocols that have a built-in probe
  */
 static struct proto builtins[] = {
-    /* description   service  saddr  log_level  keepalive  probe  */
-    { "ssh",         "sshd",   NULL,  1,        0,         is_ssh_protocol},
-    { "openvpn",     NULL,     NULL,  1,        0,         is_openvpn_protocol },
-    { "tinc",        NULL,     NULL,  1,        0,         is_tinc_protocol },
-    { "xmpp",        NULL,     NULL,  1,        0,         is_xmpp_protocol },
-    { "http",        NULL,     NULL,  1,        0,         is_http_protocol },
-    { "ssl",         NULL,     NULL,  1,        0,         is_tls_protocol },
-    { "tls",         NULL,     NULL,  1,        0,         is_tls_protocol },
-    { "adb",         NULL,     NULL,  1,        0,         is_adb_protocol },
-    { "anyprot",     NULL,     NULL,  1,        0,         is_true }
+    /* description   service  saddr  log_level  keepalive  fork  probe  */
+    { "ssh",         "sshd",   NULL,  1,        0,         1,    is_ssh_protocol},
+    { "openvpn",     NULL,     NULL,  1,        0,         1,    is_openvpn_protocol },
+    { "tinc",        NULL,     NULL,  1,        0,         1,    is_tinc_protocol },
+    { "xmpp",        NULL,     NULL,  1,        0,         0,    is_xmpp_protocol },
+    { "http",        NULL,     NULL,  1,        0,         0,    is_http_protocol },
+    { "ssl",         NULL,     NULL,  1,        0,         0,    is_tls_protocol },
+    { "tls",         NULL,     NULL,  1,        0,         0,    is_tls_protocol },
+    { "adb",         NULL,     NULL,  1,        0,         0,    is_adb_protocol },
+    { "anyprot",     NULL,     NULL,  1,        0,         0,    is_true }
 };
 
 static struct proto *protocols;
@@ -236,30 +236,79 @@ static int is_sni_alpn_protocol(const char *p, int len, struct proto *proto)
 
 static int is_tls_protocol(const char *p, int len, struct proto *proto)
 {
-    if (len < 3)
+    if (len < 6)
         return PROBE_AGAIN;
 
-    /* TLS packet starts with a record "Hello" (0x16), followed by version
-     * (0x03 0x00-0x03) (RFC6101 A.1)
-     * This means we reject SSLv2 and lower, which is actually a good thing (RFC6176)
+    /* TLS packet starts with a record "Hello" (0x16), followed by the number of
+     * the highest version of SSL/TLS supported.
+     *
+     * A SSLv2 record header contains a two or three byte length code. If the
+     * most significant bit is set in the first byte of the record length code
+     * then the record has no padding and the total header length will be 2
+     * bytes,  otherwise the record has padding and the total header length will
+     * be 3 bytes. Next, a 1 char sized client-hello (0x01) is expected,
+     * followed by a 2 char sized version that indicates the highest version of
+     * TLS/SSL supported by the sender. [SSL2] Hickman, Kipp, "The SSL Protocol"
+     *
+     * We're checking the highest version of TLS/SSL supported against
+     * (0x03 0x00-0x03) (RFC6101 A.1). This means we reject the usage of SSLv2
+     * and lower, which is actually a good thing (RFC6176).
      */
-    return p[0] == 0x16 && p[1] == 0x03 && ( p[2] >= 0 && p[2] <= 0x03);
+    if (p[0] == 0x16) // TLS client-hello
+        return p[1] == 0x03 && ( p[2] >= 0 && p[2] <= 0x03);
+    if ((p[0] & 0x80) != 0) // SSLv2 client-hello, no padding
+        return p[2] == 0x01 && p[3] == 0x03 && ( p[4] >= 0 && p[4] <= 0x03);
+    else // SSLv2 client-hello, padded
+        return p[3] == 0x01 && p[4] == 0x03 && ( p[5] >= 0 && p[5] <= 0x03);
 }
 
-static int is_adb_protocol(const char *p, int len, struct proto *proto)
+static int probe_adb_cnxn_message(const char *p)
 {
-    if (len < 30)
-        return PROBE_AGAIN;
-
     /* The initial ADB host->device packet has a command type of CNXN, and a
      * data payload starting with "host:".  Note that current versions of the
      * client hardcode "host::" (with empty serialno and banner fields) but
      * other clients may populate those fields.
-     *
-     * We aren't checking amessage.data_length, under the assumption that
-     * a packet >= 30 bytes long will have "something" in the payload field.
      */
     return !memcmp(&p[0], "CNXN", 4) && !memcmp(&p[24], "host:", 5);
+}
+
+static int is_adb_protocol(const char *p, int len, struct proto *proto)
+{
+    /* amessage.data_length is not being checked, under the assumption that
+     * a packet >= 30 bytes will have "something" in the payload field.
+     *
+     * 24 bytes for the message header and 5 bytes for the "host:" tag.
+     *
+     * ADB protocol:
+     * https://android.googlesource.com/platform/system/adb/+/master/protocol.txt
+     */
+    static const unsigned int min_data_packet_size = 30;
+
+    if (len < min_data_packet_size)
+        return PROBE_AGAIN;
+
+    if (probe_adb_cnxn_message(&p[0]) == PROBE_MATCH)
+        return PROBE_MATCH;
+
+    /* In ADB v26.0.0 rc1-4321094, the initial host->device packet sends an
+     * empty message before sending the CNXN command type. This was an
+     * unintended side effect introduced in
+     * https://android-review.googlesource.com/c/342653, and will be reverted for
+     * a future release.
+     */
+    static const unsigned char empty_message[] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff
+    };
+
+    if (len < min_data_packet_size + sizeof(empty_message))
+        return PROBE_AGAIN;
+
+    if (memcmp(&p[0], empty_message, sizeof(empty_message)))
+        return PROBE_NEXT;
+
+    return probe_adb_cnxn_message(&p[sizeof(empty_message)]);
 }
 
 static int regex_probe(const char *p, int len, struct proto *proto)

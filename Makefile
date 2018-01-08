@@ -24,8 +24,10 @@ endif
 CC ?= gcc
 CFLAGS ?=-Wall -g $(CFLAGS_COV)
 
-LIBS=-Wl,--as-needed
+LIBS=
 OBJS=common.o sslh-main.o probe.o tls.o
+
+CONDITIONAL_TARGETS=
 
 ifneq ($(strip $(USELIBWRAP)),)
 	LIBS:=$(LIBS) -lwrap
@@ -38,7 +40,7 @@ endif
 
 ifneq ($(strip $(USELIBPCRE)),)
 	CPPFLAGS+=-DLIBPCRE
-	LIBS:=$(LIBS) -Wl,-Bstatic -lpcreposix -Wl,-Bdynamic -lpcre
+	LIBS:=$(LIBS) -lpcreposix
 endif
 
 ifneq ($(strip $(USELIBCONFIG)),)
@@ -52,14 +54,15 @@ ifneq ($(strip $(USELIBCAP)),)
 endif
 
 ifneq ($(strip $(USESYSTEMD)),)
-        LIBS:=$(LIBS) -Wl,-Bstatic -lsystemd -Wl,-Bdynamic
+        LIBS:=$(LIBS) -lsystemd
         CPPFLAGS+=-DSYSTEMD
+	CONDITIONAL_TARGETS+=systemd-sslh-generator
 endif
 
 
-all: sslh $(MAN) echosrv
+all: sslh $(MAN) echosrv $(CONDITIONAL_TARGETS)
 
-.c.o: *.h
+.c.o: *.h version.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $<
 
 version.h:
@@ -80,7 +83,7 @@ sslh-select: version.h $(OBJS) sslh-select.o Makefile common.h
 systemd-sslh-generator: systemd-sslh-generator.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o systemd-sslh-generator systemd-sslh-generator.o -lconfig
 
-echosrv: $(OBJS) echosrv.o
+echosrv: version.h $(OBJS) echosrv.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o echosrv echosrv.o probe.o common.o tls.o $(LIBS)
 
 $(MAN): sslh.pod Makefile

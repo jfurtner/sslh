@@ -6,6 +6,7 @@
 
 #define SYSLOG_NAMES
 #define _GNU_SOURCE
+#include <stddef.h>
 #include <stdarg.h>
 #include <grp.h>
 
@@ -40,7 +41,7 @@ int foreground = 0;
 int background = 0;
 int transparent = 0;
 int numeric = 0;
-const char *user_name, *pid_file, *facility = "auth";
+const char *user_name, *pid_file, *chroot_path, *facility = "auth";
 
 struct addrinfo *addr_listen = NULL; /* what addresses do we listen to? */
 
@@ -81,8 +82,9 @@ int get_fd_sockets(int *sockfd[])
       exit(1);
     }
     if (sd > 0) {
+      int i;
       *sockfd = malloc(sd * sizeof(*sockfd[0]));
-      for (int i = 0; i < sd; i++) {
+      for (i = 0; i < sd; i++) {
         (*sockfd)[i] = SD_LISTEN_FDS_START + i;
       }
     }
@@ -143,14 +145,9 @@ int start_listen_sockets(int *sockfd[], struct addrinfo *addr_list)
            check_res_dump(CR_WARN, res, addr, "setsockopt(IP_FREEBIND)");
            }
 
-	   /* If transparent proxy enabled and ipv6 address then only listen on IPv6 port.
-		* Transparent proxying fails if you don't.
-		* */
-       if (transparent && saddr->ss_family == AF_INET6)
-	   {
-//fprintf(stderr, "Transparent set and IPv6\n");
-			   res = setsockopt((*sockfd)[i], IPPROTO_IPV6, IPV6_V6ONLY, (char*)&one, sizeof(one));
-			   check_res_dumpdie(res, addr, "setsockopt(IPV6_V6ONLY)");
+       if (addr->ai_addr->sa_family == AF_INET6) {
+           res = setsockopt((*sockfd)[i], IPPROTO_IPV6, IPV6_V6ONLY, (char*)&one, sizeof(one));
+           check_res_dump(CR_WARN, res, addr, "setsockopt(IPV6_V6ONLY)");
        }
 
        res = bind((*sockfd)[i], addr->ai_addr, addr->ai_addrlen);
@@ -298,17 +295,19 @@ int connect_addr(struct connection *cnx, int fd_from)
 int defer_write(struct queue *q, void* data, int data_size)
 {
     char *p;
+    ptrdiff_t data_offset = q->deferred_data - q->begin_deferred_data;
     if (verbose)
         fprintf(stderr, "**** writing deferred on fd %d\n", q->fd);
 
-    p = realloc(q->begin_deferred_data, q->deferred_data_size + data_size);
+    p = realloc(q->begin_deferred_data, data_offset + q->deferred_data_size + data_size);
     if (!p) {
         perror("realloc");
         exit(1);
     }
 
-    q->deferred_data = q->begin_deferred_data = p;
-    p += q->deferred_data_size;
+    q->begin_deferred_data = p;
+    q->deferred_data = p + data_offset;
+    p += data_offset + q->deferred_data_size;
     q->deferred_data_size += data_size;
     memcpy(p, data, data_size);
 
@@ -456,18 +455,24 @@ char* sprintaddr(char* buf, size_t size, struct addrinfo *a)
 
 /* Turns a hostname and port (or service) into a list of struct addrinfo
  * returns 0 on success, -1 otherwise and logs error
- *
- * *host gets modified
- **/
-int resolve_split_name(struct addrinfo **out, char* host, const char* serv)
+ */
+int resolve_split_name(struct addrinfo **out, const char* ct_host, const char* serv)
 {
    struct addrinfo hint;
    char *end;
    int res;
+   char* host;
 
    memset(&hint, 0, sizeof(hint));
    hint.ai_family = PF_UNSPEC;
    hint.ai_socktype = SOCK_STREAM;
+
+   /* Copy parameter so not to clobber data in libconfig */
+   res = asprintf(&host, "%s", ct_host);
+   if (res == -1) {
+       log_message(LOG_ERR, "asprintf: cannot allocate memory");
+       return -1;
+   }
 
    /* If it is a RFC-Compliant IPv6 address ("[1234::12]:443"), remove brackets
     * around IP address */
@@ -480,10 +485,10 @@ int resolve_split_name(struct addrinfo **out, char* host, const char* serv)
        *end = 0; /* remove last bracket */
    }
 
-
    res = getaddrinfo(host, serv, &hint, out);
    if (res)
       log_message(LOG_ERR, "%s `%s:%s'\n", gai_strerror(res), host, serv);
+   free(host);
    return res;
 }
 
@@ -725,22 +730,35 @@ void set_capabilities(void) {
 }
 
 /* We don't want to run as root -- drop privileges if required */
-void drop_privileges(const char* user_name)
+void drop_privileges(const char* user_name, const char* chroot_path)
 {
     int res;
-    struct passwd *pw = getpwnam(user_name);
+    struct passwd *pw = NULL;
+
+    if (user_name) {
+        pw = getpwnam(user_name);
     if (!pw) {
         fprintf(stderr, "%s: not found\n", user_name);
         exit(2);
     }
     if (verbose)
         fprintf(stderr, "turning into %s\n", user_name);
+    }
 
+    if (chroot_path) {
+        if (verbose)
+            fprintf(stderr, "chrooting into %s\n", chroot_path);
+
+        res = chroot(chroot_path);
+        CHECK_RES_DIE(res, "chroot");
+    }
+
+    if (user_name) {
     set_keepcaps(1);
 
-    /* remove extraneous groups in case we belong to several extra groups that
-     * may have unwanted rights. If non-root when calling setgroups(), it
-     * fails, which is fine because... we have no unwanted rights
+        /* remove extraneous groups in case we belong to several extra groups
+         * that may have unwanted rights. If non-root when calling setgroups(),
+         * it fails, which is fine because... we have no unwanted rights
      * (see POS36-C for security context)
      * */
     setgroups(0, NULL);
@@ -752,6 +770,7 @@ void drop_privileges(const char* user_name)
 
     set_capabilities();
     set_keepcaps(0);
+    }
 }
 
 /* Writes my PID */
